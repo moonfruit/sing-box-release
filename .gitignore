@@ -1,0 +1,7 @@
+dist/
+*.tar.gz
+*.zip
+*.deb
+*.rpm
+.DS_Store
+.claude/

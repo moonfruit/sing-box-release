@@ -1,0 +1,283 @@
+name: Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Optional upstream tag (e.g. v1.12.0-reF1nd). Leave empty to auto-detect the latest -reF1nd tag."
+        required: false
+        type: string
+      force:
+        description: "Rebuild even if a Release with the same tag already exists in this repository."
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    - cron: "0 4 * * *"
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM_REPO: reF1nd/sing-box
+  GO_VERSION: "~1.25.9"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.inputs.tag || 'auto' }}
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    name: Detect upstream tag
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+      version: ${{ steps.pick.outputs.version }}
+      should_build: ${{ steps.check.outputs.should_build }}
+    steps:
+      - name: Pick tag
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${INPUT_TAG:-}" ]]; then
+            TAG="${INPUT_TAG}"
+            echo "Using tag from workflow_dispatch input: ${TAG}"
+          else
+            TAG=$(gh api -H "X-GitHub-Api-Version: 2022-11-28" \
+              "/repos/${UPSTREAM_REPO}/tags?per_page=100" --paginate \
+              --jq '.[].name | select(endswith("-reF1nd"))' \
+              | sort -V -r | head -n 1)
+            echo "Auto-detected latest -reF1nd tag: ${TAG:-<none>}"
+          fi
+          if [[ -z "${TAG}" ]]; then
+            echo "::error::No -reF1nd tag found in ${UPSTREAM_REPO}." >&2
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+      - name: Check existing release
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.pick.outputs.tag }}
+          FORCE: ${{ github.event.inputs.force }}
+        run: |
+          set -euo pipefail
+          if gh release view "${TAG}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists in ${{ github.repository }}."
+            if [[ "${FORCE}" == "true" ]]; then
+              echo "force=true requested, will rebuild."
+              echo "should_build=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Skipping (use force=true to rebuild)."
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "Release ${TAG} not found, will build."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build ${{ matrix.os }}-${{ matrix.arch }}${{ matrix.variant && format('-{0}', matrix.variant) }}
+    needs: detect
+    if: needs.detect.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: linux, arch: arm64, variant: purego, naive: true }
+          - { os: linux, arch: arm64, variant: glibc,  naive: true }
+          - { os: linux, arch: arm64, variant: musl,   naive: true }
+    steps:
+      - name: Checkout upstream at tag
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.detect.outputs.tag }}
+          fetch-depth: 0
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+      - name: Set build tags
+        run: |
+          set -xeuo pipefail
+          if [[ "${{ matrix.naive }}" == "true" ]]; then
+            TAGS=$(cat release/DEFAULT_BUILD_TAGS)
+          else
+            TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS)
+          fi
+          if [[ "${{ matrix.variant }}" == "purego" ]]; then
+            TAGS="${TAGS},with_purego"
+          elif [[ "${{ matrix.variant }}" == "musl" ]]; then
+            TAGS="${TAGS},with_musl"
+          fi
+          echo "BUILD_TAGS=${TAGS}" >> "${GITHUB_ENV}"
+      - name: Set shared ldflags
+        run: |
+          echo "LDFLAGS_SHARED=$(cat release/LDFLAGS)" >> "${GITHUB_ENV}"
+      - name: Clone cronet-go
+        if: matrix.naive
+        run: |
+          set -xeuo pipefail
+          CRONET_GO_VERSION=$(cat .github/CRONET_GO_VERSION)
+          git init ~/cronet-go
+          git -C ~/cronet-go remote add origin https://github.com/sagernet/cronet-go.git
+          git -C ~/cronet-go fetch --depth=1 origin "$CRONET_GO_VERSION"
+          git -C ~/cronet-go checkout FETCH_HEAD
+          git -C ~/cronet-go submodule update --init --recursive --depth=1
+      - name: Regenerate Debian keyring
+        if: matrix.naive
+        run: |
+          set -xeuo pipefail
+          rm -f ~/cronet-go/naiveproxy/src/build/linux/sysroot_scripts/keyring.gpg
+          cd ~/cronet-go
+          GPG_TTY=/dev/null ./naiveproxy/src/build/linux/sysroot_scripts/generate_keyring.sh
+      - name: Cache Chromium toolchain
+        if: matrix.naive
+        id: cache-chromium-toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/cronet-go/naiveproxy/src/third_party/llvm-build/
+            ~/cronet-go/naiveproxy/src/gn/out/
+            ~/cronet-go/naiveproxy/src/chrome/build/pgo_profiles/
+            ~/cronet-go/naiveproxy/src/out/sysroot-build/
+          key: chromium-toolchain-${{ matrix.arch }}-${{ matrix.variant }}-${{ hashFiles('.github/CRONET_GO_VERSION') }}
+      - name: Download Chromium toolchain
+        if: matrix.naive
+        run: |
+          set -xeuo pipefail
+          cd ~/cronet-go
+          if [[ "${{ matrix.variant }}" == "musl" ]]; then
+            go run ./cmd/build-naive --target=linux/${{ matrix.arch }} --libc=musl download-toolchain
+          else
+            go run ./cmd/build-naive --target=linux/${{ matrix.arch }} download-toolchain
+          fi
+      - name: Set Chromium toolchain environment
+        if: matrix.naive
+        run: |
+          set -xeuo pipefail
+          cd ~/cronet-go
+          if [[ "${{ matrix.variant }}" == "musl" ]]; then
+            go run ./cmd/build-naive --target=linux/${{ matrix.arch }} --libc=musl env >> "$GITHUB_ENV"
+          else
+            go run ./cmd/build-naive --target=linux/${{ matrix.arch }} env >> "$GITHUB_ENV"
+          fi
+      - name: Build (purego)
+        if: matrix.variant == 'purego'
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -xeuo pipefail
+          mkdir -p dist
+          go build -v -trimpath -o dist/sing-box -tags "${BUILD_TAGS}" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ needs.detect.outputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+            ./cmd/sing-box
+      - name: Extract libcronet.so
+        if: matrix.variant == 'purego' && matrix.naive
+        run: |
+          set -xeuo pipefail
+          cd ~/cronet-go
+          CGO_ENABLED=0 go run -v ./cmd/build-naive extract-lib --target ${{ matrix.os }}/${{ matrix.arch }} -o "$GITHUB_WORKSPACE/dist"
+      - name: Build (glibc)
+        if: matrix.variant == 'glibc'
+        env:
+          CGO_ENABLED: "1"
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -xeuo pipefail
+          mkdir -p dist
+          go build -v -trimpath -o dist/sing-box -tags "${BUILD_TAGS}" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ needs.detect.outputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+            ./cmd/sing-box
+      - name: Build (musl)
+        if: matrix.variant == 'musl'
+        env:
+          CGO_ENABLED: "1"
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -xeuo pipefail
+          mkdir -p dist
+          go build -v -trimpath -o dist/sing-box -tags "${BUILD_TAGS}" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ needs.detect.outputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+            ./cmd/sing-box
+      - name: Set archive name
+        run: |
+          set -xeuo pipefail
+          DIR_NAME="sing-box-${{ needs.detect.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}"
+          if [[ "${{ matrix.variant }}" == "glibc" ]]; then
+            DIR_NAME="${DIR_NAME}-glibc"
+          elif [[ "${{ matrix.variant }}" == "musl" ]]; then
+            DIR_NAME="${DIR_NAME}-musl"
+          fi
+          echo "DIR_NAME=${DIR_NAME}" >> "${GITHUB_ENV}"
+      - name: Archive
+        run: |
+          set -xeuo pipefail
+          cd dist
+          mkdir -p "${DIR_NAME}"
+          cp ../LICENSE "${DIR_NAME}"
+          cp sing-box "${DIR_NAME}"
+          if [ -f libcronet.so ]; then
+            cp libcronet.so "${DIR_NAME}"
+          fi
+          tar -czvf "${DIR_NAME}.tar.gz" "${DIR_NAME}"
+          rm -r "${DIR_NAME}"
+          rm -f sing-box libcronet.so
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.os }}_${{ matrix.arch }}${{ matrix.variant && format('-{0}', matrix.variant) }}
+          path: dist
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish release
+    needs:
+      - detect
+      - build
+    if: needs.detect.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: dist
+          merge-multiple: true
+      - name: List artifacts
+        run: ls -la dist
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.detect.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2016
+          NOTES=$(printf 'Built from upstream tag [`%s`](https://github.com/%s/releases/tag/%s).\n' "${TAG}" "${UPSTREAM_REPO}" "${TAG}")
+          if gh release view "${TAG}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release ${TAG} exists, uploading assets with --clobber."
+            gh release upload "${TAG}" dist/*.tar.gz --repo "${{ github.repository }}" --clobber
+          else
+            echo "Creating release ${TAG}."
+            gh release create "${TAG}" \
+              --repo "${{ github.repository }}" \
+              --title "${TAG}" \
+              --notes "${NOTES}" \
+              dist/*.tar.gz
+          fi
