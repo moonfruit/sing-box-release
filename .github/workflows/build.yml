@@ -12,6 +12,11 @@ on:
         required: false
         type: boolean
         default: false
+      gitee_force_push:
+        description: "Force push the latest GitHub Release musl artifact to Gitee binary branch even if no new build."
+        required: false
+        type: boolean
+        default: false
   schedule:
     - cron: "0 4 * * *"
 
@@ -281,3 +286,55 @@ jobs:
               --notes "${NOTES}" \
               dist/*.tar.gz
           fi
+
+  gitee-push:
+    name: Push musl artifact to Gitee
+    needs:
+      - detect
+      - release
+    if: |
+      !cancelled() && needs.detect.result == 'success' && (
+        (needs.detect.outputs.should_build == 'true' && needs.release.result == 'success') ||
+        (github.event_name == 'workflow_dispatch' && inputs.gitee_force_push == true)
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Download musl tarball from GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.detect.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "${TAG}" \
+            --repo "${{ github.repository }}" \
+            --pattern '*linux-arm64-musl.tar.gz' \
+            --dir dist
+          ls -lh dist
+      - name: Force push to Gitee binary branch
+        env:
+          GITEE_USER: ${{ secrets.GITEE_USER }}
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+          VERSION: ${{ needs.detect.outputs.version }}
+          TAG: ${{ needs.detect.outputs.tag }}
+        run: |
+          set -euo pipefail
+          test -n "${GITEE_USER}" || { echo "::error::GITEE_USER secret is missing" >&2; exit 1; }
+          test -n "${GITEE_TOKEN}" || { echo "::error::GITEE_TOKEN secret is missing" >&2; exit 1; }
+
+          WORK=$(mktemp -d)
+          cp dist/sing-box-*-linux-arm64-musl.tar.gz "${WORK}/"
+          printf '%s\n' "${VERSION}" > "${WORK}/version.txt"
+          cd "${WORK}"
+
+          git init -q -b binary
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add .
+          git commit -q -m "sing-box ${TAG} linux-arm64-musl"
+
+          # token-based remote, mirrors sing-rules/checkout-gitee.sh
+          git remote add gitee "https://${GITEE_USER}:${GITEE_TOKEN}@gitee.com/moonfruit/private.git"
+          git push -f gitee binary
