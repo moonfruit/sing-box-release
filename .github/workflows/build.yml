@@ -17,8 +17,6 @@ on:
         required: false
         type: boolean
         default: false
-  schedule:
-    - cron: "0 4 * * *"
 
 permissions:
   contents: write
@@ -96,8 +94,8 @@ jobs:
       matrix:
         include:
           - { os: linux, arch: arm64, variant: purego, naive: true }
-          - { os: linux, arch: arm64, variant: glibc,  naive: true }
-          - { os: linux, arch: arm64, variant: musl,   naive: true }
+          - { os: linux, arch: arm64, variant: glibc, naive: true }
+          - { os: linux, arch: arm64, variant: musl, naive: true }
     steps:
       - name: Checkout upstream at tag
         uses: actions/checkout@v5
